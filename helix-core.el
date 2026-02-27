@@ -67,6 +67,14 @@ Nil if no find has taken place while `helix-mode' is active.")
 (defvar helix-space-map nil "Keymap for Space mode.")
 (defvar helix-window-map nil "Keymap for Window mode.")
 
+;; Forward declaration - defined later with keymap initializers
+(defvar helix--state-to-keymap-alist)
+
+(defvar helix--mode-keybindings nil
+  "Alist of ((MODE . STATE) . sparse-keymap).
+MODE is a major or minor mode symbol.  STATE is a helix state symbol.
+Stores mode-specific helix bindings registered via `helix-define-key'.")
+
 (defun helix--unload-current-state ()
   "Deactivate the minor mode described by `helix--current-state'."
   (let ((mode (alist-get helix--current-state helix-state-mode-alist)))
@@ -79,7 +87,8 @@ Nil if no find has taken place while `helix-mode' is active.")
     (helix--clear-data)
     (setq-local helix--current-state state)
     (let ((mode (alist-get state helix-state-mode-alist)))
-      (funcall mode 1))))
+      (funcall mode 1))
+    (helix--refresh-overriding-maps)))
 
 (defun helix--clear-data ()
   "Clear any intermediate data, e.g. selections/mark."
@@ -650,23 +659,60 @@ Example that defines the typable command ':format':
     (space . ,helix-space-map))
   "Alist mapping a state symbol to a Helix keymap.")
 
-(defun helix-define-key (state key def)
-  "Define a new Helix command mapping KEY to the keymap associated with STATE.
+(defun helix-define-key (state key def &optional mode)
+  "Define a Helix keybinding for KEY to DEF.
 
-Argument STATE must be one of:
+When MODE is nil, bind to the keymap associated with STATE from
+`helix--state-to-keymap-alist'.  When MODE is provided (e.g.,
+\\='dired-mode), store the binding so it takes precedence via
+`minor-mode-overriding-map-alist' when that mode is active.
 
-- insert
-- normal
-- view
-- goto
-- window
-- space
+Argument STATE must be one of: insert, normal, view, goto, window, space.
 
-Argument DEF should be an interactive function, matching the usage
-pattern of `define-key'."
-  (if-let (keymap (alist-get state helix--state-to-keymap-alist))
-      (define-key keymap key def)
-    (error "Invalid state %s" state)))
+Argument KEY and DEF follow the same conventions as `define-key'.
+
+Optional argument MODE is a major or minor mode symbol for which to
+create mode-specific bindings that override helix defaults.
+
+Example:
+  ;; Standard: bind to Helix's normal state keymap
+  (helix-define-key \\='normal \"s\" #\\='my-command)
+
+  ;; Major-mode specific: override normal state bindings in dired
+  (with-eval-after-load \\='dired
+    (helix-define-key \\='normal \"j\" #\\='dired-next-line \\='dired-mode)
+    (helix-define-key \\='normal \"k\" #\\='dired-previous-line \\='dired-mode))"
+  (unless (alist-get state helix--state-to-keymap-alist)
+    (error "Invalid state %s" state))
+  (if mode
+      ;; Store binding in helix--mode-keybindings
+      (let* ((alist-key (cons mode state))
+             (entry (assoc alist-key helix--mode-keybindings)))
+        (unless entry
+          (setq entry (cons alist-key (make-sparse-keymap)))
+          (push entry helix--mode-keybindings))
+        (define-key (cdr entry) key def))
+    ;; Bind to global state keymap
+    (let ((state-keymap (alist-get state helix--state-to-keymap-alist)))
+      (define-key state-keymap key def))))
+
+(defun helix--refresh-overriding-maps ()
+  "Rebuild `minor-mode-overriding-map-alist' for the current buffer."
+  (let ((state helix--current-state)
+        (state-mode (alist-get helix--current-state helix-state-mode-alist))
+        (overrides nil))
+    (dolist (entry helix--mode-keybindings)
+      (let ((mode (caar entry)))
+        (when (and (eq (cdar entry) state)
+                   (or (eq mode major-mode)
+                       (and (boundp mode) (symbol-value mode))))
+          (push (cdr entry) overrides))))
+    (setq minor-mode-overriding-map-alist
+          (assq-delete-all state-mode minor-mode-overriding-map-alist))
+    (when overrides
+      (let ((base-keymap (alist-get state helix--state-to-keymap-alist)))
+        (push (cons state-mode (make-composed-keymap overrides base-keymap))
+              minor-mode-overriding-map-alist)))))
 
 (define-minor-mode helix-insert-mode
   "Helix INSERT state minor mode."
@@ -692,7 +738,8 @@ pattern of `define-key'."
   (if helix-normal-mode
       (progn
         (setq-local helix--current-state 'normal)
-        (setq cursor-type 'box))))
+        (setq cursor-type 'box)
+        (helix--refresh-overriding-maps))))
 
 (defun helix-mode-maybe-activate (&optional status)
   "Activate `helix-normal-mode' if `helix-global-mode' is non-nil.
@@ -700,7 +747,8 @@ pattern of `define-key'."
 A non-nil value of STATUS can be passed into `helix-normal-mode' for
 disabling."
   (when (and (not (minibufferp)) helix-global-mode)
-    (helix-normal-mode (if status status 1))))
+    (helix-normal-mode (if status status 1))
+    (helix--refresh-overriding-maps)))
 
 ;;;###autoload
 (defun helix-mode-all (&optional status)
